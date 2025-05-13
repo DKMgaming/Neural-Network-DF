@@ -1,3 +1,117 @@
+import streamlit as st
+import numpy as np
+import pandas as pd
+from xgboost import XGBRegressor
+from sklearn.ensemble import RandomForestRegressor, StackingRegressor
+from sklearn.model_selection import train_test_split, RandomizedSearchCV
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import joblib
+from io import BytesIO
+from math import atan2, degrees, radians, sin, cos, sqrt
+import folium
+from streamlit_folium import st_folium
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense
+
+# --- Hàm phụ cho Triangulation ---
+def calculate_azimuth(lat1, lon1, lat2, lon2):
+    d_lon = radians(lon2 - lon1)
+    lat1 = radians(lat1)
+    lat2 = radians(lat2)
+    x = sin(d_lon) * cos(lat2)
+    y = cos(lat1)*sin(lat2) - sin(lat1)*cos(lat2)*cos(d_lon)
+    azimuth = (degrees(atan2(x, y)) + 360) % 360
+    return azimuth
+
+def calculate_distance(lat1, lon1, lat2, lon2):
+    # Tính khoảng cách giữa 2 điểm (km)
+    R = 6371.0  # Bán kính Trái Đất (km)
+    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+    d_lat = lat2 - lat1
+    d_lon = lon2 - lon1
+    a = sin(d_lat / 2)**2 + cos(lat1) * cos(lat2) * sin(d_lon / 2)**2
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+    distance = R * c
+    return distance
+
+def triangulation(lat1, lon1, az1, lat2, lon2, az2):
+    # Tính toán tọa độ nguồn phát từ 2 trạm thu và các góc phương vị
+    # Chuyển đổi azimuth và tọa độ sang radian
+    az1 = radians(az1)
+    az2 = radians(az2)
+    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+
+    # Tính khoảng cách giữa 2 trạm thu
+    distance = calculate_distance(lat1, lon1, lat2, lon2)
+    
+    # Công thức để tính toán tọa độ nguồn phát xạ
+    d = distance  # Khoảng cách giữa 2 trạm thu
+    a1 = az1  # Phương vị của trạm thu 1
+    a2 = az2  # Phương vị của trạm thu 2
+
+    x = (sin(a1) - sin(a2)) * d / (cos(a1) - cos(a2))
+    y = (sin(a2) * cos(a1) - cos(a2) * sin(a1)) * d / (cos(a1) - cos(a2))
+
+    # Tính toán vị trí nguồn phát
+    lat3 = lat1 + y / 6371.0  # Độ vĩ độ của nguồn phát
+    lon3 = lon1 + x / (6371.0 * cos(lat1))  # Độ kinh độ của nguồn phát
+
+    # Chuyển tọa độ trở lại độ
+    lat3 = degrees(lat3)
+    lon3 = degrees(lon3)
+    
+    return lat3, lon3
+
+# --- Chuyển đổi dBm sang dBµV/m ---
+def dBm_to_dBµV_m(dBm):
+    return dBm + 120  # Công thức chuyển đổi từ dBm sang dBµV/m
+
+def simulate_signal_strength(dist_km, h, freq_mhz):
+    # Kiểm tra giá trị đầu vào của các tham số để tránh lỗi
+    if dist_km <= 0 or h <= 0 or freq_mhz <= 0:
+        raise ValueError("Các tham số dist_km, h và freq_mhz phải lớn hơn 0.")
+    
+    # Công thức tính tín hiệu với đơn vị dBm (sau khi chuyển đổi, chúng ta sẽ sử dụng dBµV/m)
+    path_loss = 32.45 + 20 * np.log10(dist_km + 0.1) + 20 * np.log10(freq_mhz + 1)
+    signal_dBm = -30 - path_loss + 10 * np.log10(h + 1)
+    
+    # Chuyển đổi tín hiệu từ dBm sang dBµV/m
+    signal_dBµV_m = dBm_to_dBµV_m(signal_dBm)
+    
+    return signal_dBµV_m
+
+def calculate_destination(lat1, lon1, azimuth_deg, distance_km):
+    # Kiểm tra xem khoảng cách có hợp lệ không
+    if distance_km <= 0:
+        raise ValueError("Khoảng cách phải lớn hơn 0.")
+    
+    # Kiểm tra các giá trị lat1, lon1, azimuth_deg có hợp lệ không
+    if not (-90 <= lat1 <= 90) or not (-180 <= lon1 <= 180):
+        raise ValueError("Vị trí tọa độ không hợp lệ.")
+    
+    R = 6371.0  # Bán kính Trái Đất (km)
+    brng = radians(azimuth_deg)  # Chuyển đổi góc phương vị sang radian
+    lat1 = radians(lat1)
+    lon1 = radians(lon1)
+    
+    # Tính toán vị trí đích
+    lat2 = np.arcsin(sin(lat1) * cos(distance_km / R) + cos(lat1) * sin(distance_km / R) * cos(brng))
+    lon2 = lon1 + atan2(sin(brng) * sin(distance_km / R) * cos(lat1), cos(distance_km / R) - sin(lat1) * sin(lat2))
+
+    # Chuyển tọa độ trở lại độ
+    lat2 = degrees(lat2)
+    lon2 = degrees(lon2)
+    
+    return lat2, lon2  # Trả về tọa độ điểm đích (lat2, lon2)
+
+
+# --- Giao diện ---
+st.set_page_config(layout="wide")
+st.title("🔭 Dự đoán tọa độ nguồn phát xạ theo hướng định vị")
+
+tab1, tab2 = st.tabs(["1. Huấn luyện mô hình", "2. Dự đoán tọa độ"])
 # --- Tab 1: Huấn luyện ---
 with tab1:
     st.subheader("📡 Huấn luyện mô hình với dữ liệu mô phỏng hoặc thực tế")
